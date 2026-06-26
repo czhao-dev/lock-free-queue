@@ -1,15 +1,15 @@
 # lfqueue — Lock-Free Multi-Producer Multi-Consumer Queue
 
-![Rust](https://img.shields.io/badge/Rust-1.63%2B-DEA584.svg?logo=rust)
-![Cargo](https://img.shields.io/badge/Cargo-stable-CB6219.svg?logo=rust)
+![C++](https://img.shields.io/badge/C%2B%2B-17-00599C.svg?logo=cplusplus)
+![CMake](https://img.shields.io/badge/CMake-3.16%2B-064F8C.svg?logo=cmake)
 ![ThreadSanitizer](https://img.shields.io/badge/ThreadSanitizer-clean-brightgreen.svg)
 ![Tests](https://img.shields.io/badge/tests-passing-brightgreen.svg)
 ![License](https://img.shields.io/badge/License-MIT-yellow.svg)
 
 A bounded, lock-free MPMC (multi-producer multi-consumer) queue implemented in
-Rust using atomic operations and explicit memory ordering. Benchmarked against
-a mutex-protected queue across varying thread counts and contention levels,
-with discussion of the correctness reasoning required for lock-free design.
+C++ using atomic operations and explicit memory ordering. Benchmarked against a
+mutex-protected queue across varying thread counts and contention levels, with
+discussion of the correctness reasoning required for lock-free design.
 
 ---
 
@@ -31,10 +31,7 @@ to ensure operations on different cores become visible in a consistent order.
 
 `lfqueue` implements a bounded ring-buffer queue supporting multiple concurrent
 producers (`push`) and multiple concurrent consumers (`pop`), with no mutex
-anywhere in the implementation. The unsafe, manually-managed slot storage
-(`UnsafeCell<MaybeUninit<T>>`) is the same kind of code C++ writes by default —
-Rust just requires it to be explicitly marked and justified with a `// SAFETY:`
-comment at every `unsafe` block.
+anywhere in the implementation.
 
 ### Why this problem
 
@@ -79,20 +76,16 @@ addition to its data — this is the key mechanism that makes the design correct
 
 CAS is the fundamental primitive: `compare_exchange(expected, desired)` atomically
 checks whether a memory location currently holds `expected`; if so, it writes
-`desired` and returns `Ok`; otherwise it returns `Err` with the actual current
-value.
+`desired` and returns true; otherwise it returns false and updates `expected`
+with the actual current value.
 
-```rust
-use std::sync::atomic::{AtomicUsize, Ordering};
+```cpp
+std::atomic<size_t> tail;
 
-let tail = AtomicUsize::new(0);
-
-let mut pos = tail.load(Ordering::Relaxed);
-while tail
-    .compare_exchange_weak(pos, pos + 1, Ordering::Relaxed, Ordering::Relaxed)
-    .is_err()
-{
-    pos = tail.load(Ordering::Relaxed); // refresh and retry
+size_t pos = tail.load(std::memory_order_relaxed);
+while (!tail.compare_exchange_weak(pos, pos + 1,
+                                    std::memory_order_relaxed)) {
+    // pos was updated to the current value by compare_exchange_weak; retry
 }
 // This thread now "owns" slot `pos` for writing
 ```
@@ -103,12 +96,11 @@ value, and it retries with the new claim. No thread ever blocks — a failed CAS
 means "someone else made progress," which satisfies the lock-free progress
 guarantee.
 
-`compare_exchange_weak` vs `compare_exchange`: `weak` may fail spuriously
-(return `Err` even when the value matches) on some architectures due to how
-LL/SC (load-linked/store-conditional) instructions work, but is cheaper in a
-retry loop. `compare_exchange` (the "strong" form) never fails spuriously but
-may cost more per call. Inside a loop, `weak` is preferred — this is identical
-to the `compare_exchange_weak`/`compare_exchange_strong` distinction in C++.
+`compare_exchange_weak` vs `compare_exchange_strong`: `weak` may fail
+spuriously (return false even when the value matches) on some architectures due
+to how LL/SC (load-linked/store-conditional) instructions work, but is cheaper
+in a retry loop. `strong` never fails spuriously but may cost more per call.
+Inside a loop, `weak` is preferred.
 
 ### 2. The ABA Problem and Per-Slot Sequence Numbers
 
@@ -121,11 +113,11 @@ logic didn't account for.
 `lfqueue` avoids ABA by giving each slot a **sequence number** that increments
 every time the slot is reused:
 
-```rust
-struct Slot<T> {
-    sequence: AtomicUsize,
-    data: UnsafeCell<MaybeUninit<T>>,
-}
+```cpp
+struct Slot {
+    std::atomic<size_t> sequence;
+    T data;
+};
 ```
 
 A producer claiming slot `i` for the `n`-th time around the ring expects
@@ -137,47 +129,39 @@ full/empty flag into a monotonically increasing counter, eliminating the ABA
 ambiguity entirely — the sequence number encodes *which lap* around the ring
 the slot is on, not just its current state.
 
-The slot's data lives in `UnsafeCell<MaybeUninit<T>>` rather than a plain `T`
-because the slot has no valid value until a producer writes one, and Rust's
-aliasing rules require `UnsafeCell` for any memory that's mutated through a
-shared reference (`&MpmcQueue<T>` — `push`/`pop` deliberately take `&self`, not
-`&mut self`, since multiple producers/consumers call them concurrently).
-
 ### 3. Memory Ordering
 
-Rust's `std::sync::atomic::Ordering` controls what guarantees an atomic
-operation makes about the visibility and ordering of *other* memory operations
-around it — this is where most lock-free bugs live, because the code can be
-"correct" on x86 (which has strong default ordering) and fail on ARM (which
-does not). Rust's memory model is deliberately identical to C++11's
-(`std::memory_order`), so the same reasoning transfers directly.
+C++'s `std::memory_order` controls what guarantees an atomic operation makes
+about the visibility and ordering of *other* memory operations around it — this
+is where most lock-free bugs live, because the code can be "correct" on x86
+(which has strong default ordering) and fail on ARM (which does not).
 
 | Order               | Guarantee                                                          | Used for                          |
 |---------------------|---------------------------------------------------------------------|------------------------------------|
-| `Relaxed`           | Atomicity only — no ordering with other memory ops                 | Counters with no dependent data    |
-| `Acquire`           | No subsequent read/write can be reordered *before* this load        | Reading a slot's sequence before reading its data |
-| `Release`           | No preceding read/write can be reordered *after* this store         | Publishing a slot's data before updating its sequence |
-| `AcqRel`            | Both acquire and release semantics                                   | CAS operations that both read and write |
-| `SeqCst`            | Total global ordering across all threads (strongest, most expensive) | Used only where reasoning requires it |
+| `relaxed`           | Atomicity only — no ordering with other memory ops                 | Counters with no dependent data    |
+| `acquire`           | No subsequent read/write can be reordered *before* this load        | Reading a slot's sequence before reading its data |
+| `release`           | No preceding read/write can be reordered *after* this store         | Publishing a slot's data before updating its sequence |
+| `acq_rel`           | Both acquire and release semantics                                   | CAS operations that both read and write |
+| `seq_cst`           | Total global ordering across all threads (default, most expensive) | Used only where reasoning requires it |
 
 The critical pattern in `lfqueue` is **release-acquire pairing**: a producer
-writes the slot's data, then performs a `Release` store to the sequence number.
-A consumer performs an `Acquire` load of the sequence number, then reads the
+writes the slot's data, then performs a `release` store to the sequence number.
+A consumer performs an `acquire` load of the sequence number, then reads the
 data. The acquire/release pair guarantees that if the consumer observes the
 updated sequence number, it is also guaranteed to observe the data write that
 happened-before it — without this pairing, the consumer could read stale or
 partially-written data even though the sequence number appears updated, because
 without ordering constraints, the compiler or CPU may reorder the two stores.
 
-```rust
+```cpp
 // Producer
-unsafe { (*slot.data.get()).write(value); }            // (1) plain write
-slot.sequence.store(pos + 1, Ordering::Release);        // (2) release
+slot.data = std::move(value);                                    // (1) plain write
+slot.sequence.store(pos + 1, std::memory_order_release);         // (2) release
 
 // Consumer
-let seq = slot.sequence.load(Ordering::Acquire);        // (3) acquire
-if seq == expected {
-    let value = unsafe { (*slot.data.get()).assume_init_read() }; // (4) plain read
+size_t seq = slot.sequence.load(std::memory_order_acquire);      // (3) acquire
+if (seq == expected) {
+    T value = std::move(slot.data);                              // (4) plain read
 }
 ```
 
@@ -193,14 +177,13 @@ invalidates the cache line for consumers and vice versa, even though they touch
 logically independent data. This is **false sharing**, and it can degrade
 throughput by an order of magnitude under contention.
 
-`lfqueue` pads `head` and `tail` to separate 64-byte cache lines using
-`#[repr(align(64))]`:
+`lfqueue` pads `head` and `tail` to separate 64-byte cache lines:
 
-```rust
-#[repr(align(64))]
-struct CachePadded<T> {
-    value: T,
-}
+```cpp
+struct alignas(64) AlignedAtomic {
+    std::atomic<size_t> value;
+    char padding[64 - sizeof(std::atomic<size_t>)];
+};
 ```
 
 This is a small code change with a measurable effect — the benchmarks section
@@ -218,24 +201,18 @@ node insertion) but introduce a harder problem: **safe memory reclamation**.
 When a node is dequeued from a lock-free linked list, another thread might still
 hold a pointer to it — freeing it immediately risks a use-after-free. Solving
 this requires hazard pointers, epoch-based reclamation, or RCU, each of which is
-a substantial topic on its own (and in Rust's ownership model, additionally
-needs `unsafe` to bypass the borrow checker's single-owner assumption). A
-bounded ring buffer avoids the problem entirely because slots are reused, never
-freed — at the cost of needing to handle the "queue full" case (the design
-choice below).
+a substantial topic on its own. A bounded ring buffer avoids the problem
+entirely because slots are reused, never freed — at the cost of needing to
+handle the "queue full" case (the design choice below).
 
 **Behavior on full/empty: spin vs block**
 
-`push` on a full queue returns `Err(value)` — handing the value back to the
-caller rather than dropping it — and `pop` on an empty queue returns `None`,
-immediately and non-blocking, rather than spinning or blocking. This keeps the
-data structure itself fully lock-free and leaves the retry/backoff policy to
-the caller — appropriate because different use cases want different policies
-(busy-spin for ultra-low-latency, exponential backoff for CPU-friendly polling,
-or falling back to a condition variable for a hybrid design). Returning the
-value on failure rather than a bare `bool` (as the C++ original did via an
-out-parameter) is a natural fit for Rust's move semantics: the caller never
-loses ownership of a value it failed to enqueue.
+`push` on a full queue and `pop` on an empty queue return `false` immediately
+(non-blocking) rather than spinning or blocking. This keeps the data structure
+itself fully lock-free and leaves the retry/backoff policy to the caller —
+appropriate because different use cases want different policies (busy-spin for
+ultra-low-latency, exponential backoff for CPU-friendly polling, or falling back
+to a condition variable for a hybrid design).
 
 **Lock-free vs wait-free**
 
@@ -250,38 +227,37 @@ practical target for high-performance concurrent data structures.
 **Why not just use a mutex?**
 
 This is the question every interviewer will ask, and the honest answer is: for
-most applications, a `Mutex<VecDeque<T>>` is the right choice. Mutex overhead
-(tens of nanoseconds, uncontended) is negligible for most workloads, and the
-implementation is trivially correct — no `unsafe` required. Lock-free
-structures are justified specifically when: (1) the queue is on a hot path
-called millions of times per second, (2) priority inversion is a concern (a
-low-priority thread holding a lock blocking a high-priority thread), or (3) the
-structure is used in a context where blocking is unacceptable, such as a signal
-handler or real-time audio callback. The benchmarks below quantify when the
-crossover happens.
+most applications, a mutex-protected `std::deque` is the right choice. Mutex
+overhead (tens of nanoseconds, uncontended) is negligible for most workloads,
+and the implementation is trivially correct. Lock-free structures are justified
+specifically when: (1) the queue is on a hot path called millions of times per
+second, (2) priority inversion is a concern (a low-priority thread holding a
+lock blocking a high-priority thread), or (3) the structure is used in a context
+where blocking is unacceptable, such as a signal handler or real-time audio
+callback. The benchmarks below quantify when the crossover happens.
 
 ---
 
 ## Benchmarks
 
-**Hardware:** Apple M3, 8 cores (8 logical), macOS
-**Compiler:** rustc 1.96.0, `cargo build --release` (opt-level 3, codegen-units 1)
+**Hardware:** Apple M3, 8 cores (8 logical), macOS  
+**Compiler:** Apple Clang 21.0.0, `-O2 -DNDEBUG` (CMake Release)  
 **Operations:** 10,000,000 items transferred per configuration
 
 ### Throughput vs thread count (fixed 10 M total items)
 
 | Threads (P+C) | lfqueue (Mops/sec) | mutex queue (Mops/sec) |
 |:-------------:|:------------------:|:----------------------:|
-| 1 + 1         | 133.4              | 28.4                   |
-| 2 + 2         | 13.8               | 32.6                   |
-| 4 + 4         | 5.3                | 19.7                   |
-| 8 + 8         | 2.7                | 17.6                   |
+| 1 + 1         | 57.2               | 45.7                   |
+| 2 + 2         | 14.2               | 26.0                   |
+| 4 + 4         | 5.0                | 18.0                   |
+| 8 + 8         | 3.4                | 17.3                   |
 
-**Interpretation:** The lock-free queue wins decisively at 1+1 (no contention,
-avoids lock overhead entirely). As thread count rises, the CAS-based design
-suffers from cache-invalidation storms: every producer's CAS on `tail` and
-every consumer's CAS on `head` broadcasts a cache-line invalidation to all
-other cores. On Apple Silicon's strongly-ordered architecture, the mutex queue
+**Interpretation:** The lock-free queue wins at 1+1 (no contention, avoids
+lock overhead entirely). As thread count rises, the CAS-based design suffers
+from cache-invalidation storms: every producer's CAS on `tail_` and every
+consumer's CAS on `head_` broadcasts a cache-line invalidation to all other
+cores. On Apple Silicon's strongly-ordered architecture, the mutex queue
 serialises access more cheaply than repeated CAS failures under high
 contention. This is a well-known result — lock-free does not mean
 faster-under-all-conditions; it means progress without blocking. The
@@ -292,29 +268,25 @@ particularly at the tail.
 
 | Configuration               | Throughput (Mops/sec) |
 |:---------------------------:|:---------------------:|
-| Without padding (false sharing) | 3.1               |
-| With 64-byte padding            | 3.5               |
+| Without padding (false sharing) | 3.3               |
+| With 64-byte padding            | 5.0               |
 
-Padding `head` and `tail` onto separate cache lines gives a **~13%
-throughput improvement**, consistent across repeated runs, with no
-algorithmic change — the only difference is preventing the two counters from
-sharing a cache line and invalidating each other on every operation. (The
-effect size is smaller than a textbook false-sharing benchmark might suggest,
-since Apple Silicon's large L2 cache and aggressive prefetcher absorb some of
-the invalidation cost — but the direction is consistent across runs.)
+Padding `head_` and `tail_` onto separate cache lines gives a **52%
+throughput improvement** with no algorithmic change — the only difference is
+preventing the two counters from sharing a cache line and invalidating each
+other on every operation.
 
 ### Latency distribution (single producer, single consumer, 100 k samples)
 
 | Metric | lfqueue (ns) | mutex queue (ns) |
 |:------:|:------------:|:----------------:|
-| p50    | 4,500        | 11,167            |
-| p99    | 6,750        | 149,583           |
-| p999   | 11,458       | 798,917           |
+| p50    | 4,959        | 5,375            |
+| p99    | 7,167        | 18,291           |
+| p999   | 15,958       | 57,917           |
 
-The lock-free queue shows dramatically lower tail latency than the mutex
-queue. This is the expected advantage: when a thread is preempted while
-holding a mutex, every other thread stalls until it resumes, and OS scheduler
-involvement adds milliseconds of jitter at the tail. A lock-free queue never
+The lock-free queue shows a **3.6× lower p999 latency** than the mutex queue.
+This is the expected advantage: when a thread is preempted while holding a
+mutex, every other thread stalls until it resumes. A lock-free queue never
 blocks a waiter — worst case, a consumer spins briefly on a sequence number
 before the producer publishes, but it never waits for an OS reschedule.
 
@@ -326,46 +298,39 @@ before the producer publishes, but it never waits for an OS reschedule.
 
 ### Requirements
 
-- Rust 1.63+ (stable) — for `std::thread::scope`
-- Nightly toolchain, optional — only needed to run under ThreadSanitizer or Miri
+- C++20 compiler (for `std::atomic::wait`/`notify`, if used in extensions)
+  — core implementation works with C++17
+- `cmake` 3.16+
+- ThreadSanitizer support (Clang or GCC with `-fsanitize=thread`)
 
 ### Build
 
 ```bash
-cargo build --release
+cmake -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build
 ```
 
 ### Run benchmarks
 
 ```bash
-cargo run --release --example throughput_bench
-cargo run --release --example padding_bench
-cargo run --release --example latency_bench
-```
-
-Or run all three and save results to `benchmarks/results/`:
-
-```bash
-./benchmarks/run_all.sh
+./build/benchmarks/throughput_bench
+./build/benchmarks/padding_bench
+./build/benchmarks/latency_bench
 ```
 
 ### Run correctness tests
 
 ```bash
-cargo test --release
+ctest --test-dir build --output-on-failure
 ```
 
 ### Run with ThreadSanitizer
 
 ```bash
-rustup toolchain install nightly
-rustup component add rust-src --toolchain nightly
-
-RUSTFLAGS="-Z sanitizer=thread" \
-    cargo +nightly test -Z build-std --target aarch64-apple-darwin --release --tests
+cmake -B build-tsan -DCMAKE_BUILD_TYPE=Debug -DCMAKE_CXX_FLAGS="-fsanitize=thread"
+cmake --build build-tsan
+./build-tsan/tests/correctness_test
 ```
-
-(Substitute your own target triple, e.g. `x86_64-unknown-linux-gnu`.)
 
 ThreadSanitizer is essential for this project — it detects data races that may
 not manifest in normal testing but are real bugs under different scheduling or
@@ -388,69 +353,39 @@ M consumers pop and record what they receive. After completion, verify that
 every value pushed was received exactly once (no duplicates, no drops) — this
 catches the most common class of lock-free bugs.
 
-**ThreadSanitizer**: run the stress tests under TSan (nightly Rust, `-Z
-sanitizer=thread`) to catch missing memory ordering even when the functional
-test passes — TSan can detect a "correct by luck" race that would fail on
-different hardware.
+**ThreadSanitizer**: run the stress test under TSan to catch missing memory
+ordering even when the functional test passes — TSan can detect a "correct by
+luck" race that would fail on different hardware.
 
-**Loom (optional, advanced)**: [loom](https://github.com/tokio-rs/loom) is
-Rust's model-checking tool for concurrent code — the direct equivalent of
-Relacy/CDSChecker in the C++ world. It exhaustively explores thread
-interleavings for small test cases by substituting `loom`'s atomic types for
-`std`'s, providing much stronger guarantees than running many random
-iterations. Mentioned here as a stretch goal for demonstrating depth; adopting
-it would require gating the atomic imports behind `#[cfg(loom)]`.
+**Relacy / CDSChecker (optional, advanced)**: model-checking tools that
+exhaustively explore thread interleavings for small test cases, providing much
+stronger guarantees than running many random iterations. Mentioned here as a
+stretch goal for demonstrating depth.
 
 ### Results
 
 ```
-$ cargo test --release
-running 24 tests
-test mpmc_empty_and_full ... ok
-test mpmc_wraparound_order ... ok
-test mpmc_exact_capacity ... ok
-test mpmc_move_only_values ... ok
-test mpmc_rejects_zero_capacity - should panic ... ok
-test mpmc_rejects_non_power_of_two - should panic ... ok
-test mutex_empty_and_full ... ok
-test mutex_wraparound_order ... ok
-test mutex_exact_capacity ... ok
-test mutex_move_only_values ... ok
-test mutex_rejects_zero_capacity - should panic ... ok
-test mpmc_stress_1p_1c ... ok
-test mpmc_stress_2p_2c ... ok
-test mpmc_stress_4p_4c ... ok
-test mpmc_stress_8p_8c ... ok
-test mpmc_stress_many_consumers ... ok
-test mpmc_stress_many_producers ... ok
-test mpmc_stress_small_capacity_high_contention ... ok
-test mutex_stress_1p_1c ... ok
-test mutex_stress_2p_2c ... ok
-test mutex_stress_4p_4c ... ok
-test mutex_stress_8p_8c ... ok
-test mutex_stress_many_consumers ... ok
-test mutex_stress_many_producers ... ok
-test mutex_stress_small_capacity_high_contention ... ok
-
-test result: ok. 24 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+$ ctest --test-dir build-release --output-on-failure
+Test project lfqueue/build-release
+    Start 1: correctness_test
+1/1 Test #1: correctness_test .................   Passed    0.73 sec
+100% tests passed, 0 tests failed out of 1
 ```
 
-The `correctness` test suite covers, in order: empty/full boundary conditions,
-wraparound ordering, exact-capacity behavior, move-only value types (a
-non-`Copy` `Box<i32>`), and constructor validation (zero capacity, non-power-of-
-two capacity) — followed by twelve concurrent stress configurations run
-against **both** `MpmcQueue` and `MutexQueue` (1+1, 2+2, 4+4, 8+8, 1
-producer/4 consumers, 4 producers/1 consumer, and 5 repetitions of a
-small-capacity/high-contention case), each verifying every pushed value is
+The `correctness_test` binary covers, in order: empty/full boundary
+conditions, wraparound ordering, zero-capacity rejection, constructor
+validation, move-only value types, and exact-capacity behavior for the mutex
+baseline — followed by six concurrent stress configurations run against
+**both** `MPMCQueue` and `MutexQueue` (1+1, 2+2, 4+4, 8+8, 1 producer/4
+consumers, 4 producers/1 consumer), each verifying every pushed value is
 received exactly once with no drops or duplicates.
 
 ```
-$ rustup component add rust-src --toolchain nightly
-$ RUSTFLAGS="-Z sanitizer=thread" \
-    cargo +nightly test -Z build-std --target aarch64-apple-darwin --release --tests
-running 24 tests
-...
-test result: ok. 24 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+$ cmake -B build-tsan -DCMAKE_BUILD_TYPE=Debug -DCMAKE_CXX_FLAGS="-fsanitize=thread"
+$ cmake --build build-tsan
+$ ./build-tsan/tests/correctness_test
+$ echo $?
+0
 ```
 
 ThreadSanitizer reports **zero data races** across every stress configuration
@@ -465,9 +400,8 @@ the producer/consumer handoff safe under TSan's race detector, not merely
 Lock-free queues are the backbone of high-performance concurrent systems:
 
 - **Work-stealing schedulers** (used in thread pools, task-based parallelism
-  frameworks like Intel TBB and Tokio's multi-threaded runtime) use lock-free
-  deques so idle threads can steal work from busy threads without blocking
-  them.
+  frameworks like Intel TBB and Rust's Tokio) use lock-free deques so idle
+  threads can steal work from busy threads without blocking them.
 
 - **Inter-thread communication in low-latency systems** (audio processing, HFT,
   real-time control loops) requires bounded, predictable-latency message passing
@@ -502,13 +436,8 @@ handle this for you, but the underlying memory model is identical).
   avoid CAS entirely (plain atomic loads/stores suffice when there's only one
   writer per index), and benchmarking SPSC vs MPMC quantifies the cost of
   generality
-- **Loom-based model checking** — gate the atomic types behind `#[cfg(loom)]`
-  so `cargo test --features loom` can exhaustively check small interleavings,
-  rather than relying on random scheduling to surface bugs
-- **Atomic wait/notify** — Rust's standard library has an unstable
-  `Atomic*::wait`/`notify` API (mirroring C++20's `std::atomic::wait`/`notify`)
-  that would let consumers block on a futex instead of busy-polling; swap to it
-  once stabilized
+- **`std::atomic::wait`/`notify` (C++20)** — replace busy-polling consumers with
+  futex-based blocking that still avoids a full mutex
 
 ---
 
@@ -519,12 +448,8 @@ handle this for you, but the underlying memory model is identical).
 - Michael, M. & Scott, M. *Simple, Fast, and Practical Non-Blocking and
   Blocking Concurrent Queue Algorithms* (PODC 1996) — the unbounded queue
   referenced in Future Extensions
-- Bos, M. *Rust Atomics and Locks* — the standard modern reference for
-  `std::sync::atomic`, memory ordering, and building concurrent data
-  structures in Rust
-- *The Rustonomicon* — the reference for `unsafe` Rust, including
-  `UnsafeCell` and `MaybeUninit`, both used in this implementation
-- [loom](https://github.com/tokio-rs/loom) — Rust's concurrency model checker,
-  the equivalent of Relacy/CDSChecker referenced in Testing Strategy
+- Williams, A. *C++ Concurrency in Action, 2nd Edition* — the standard
+  reference for `std::atomic` and memory ordering in C++
+- *C++ Standard, `<atomic>` header* — `std::memory_order` definitions
 - Preshing, J. — preshing.com blog series on lock-free programming and memory
-  ordering (clear, practical explanations with diagrams; language-agnostic)
+  ordering (clear, practical explanations with diagrams)
