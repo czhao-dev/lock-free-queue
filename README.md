@@ -335,3 +335,28 @@ cargo test --release
 ```
 
 Expected output: **32 integration tests + 5 doc-tests**, all green.
+
+---
+
+## References
+
+- Vyukov, D. *Bounded MPMC Queue* — the per-slot sequence-number design this
+  ring buffer is based on.
+  [1024cores.net](https://www.1024cores.net/home/lock-free-algorithms/queues/bounded-mpmc-queue)
+
+- Michael, M. & Scott, M. *Simple, Fast, and Practical Non-Blocking and
+  Blocking Concurrent Queue Algorithms.* PODC 1996. — the canonical unbounded
+  lock-free queue using CAS-linked nodes and hazard-pointer reclamation.
+
+- Bos, M. *Rust Atomics and Locks* (O'Reilly, 2023) — the definitive modern
+  reference for `std::sync::atomic`, memory ordering, and building concurrent
+  data structures in Rust.
+  [marabos.nl/atomics](https://marabos.nl/atomics/)
+
+- *The Rustonomicon* — official reference for `unsafe` Rust, aliasing rules,
+  and `UnsafeCell` / `MaybeUninit` usage.
+  [doc.rust-lang.org/nomicon](https://doc.rust-lang.org/nomicon/)
+
+- Herlihy, M. & Shavit, N. *The Art of Multiprocessor Programming* (2nd ed.,
+  2021) — rigorous treatment of lock-free progress conditions, CAS, and
+  ABA-problem solutions including sequence numbers and hazard pointers.
