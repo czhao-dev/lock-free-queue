@@ -1,6 +1,6 @@
-use lfqueue::{BoundedQueue, MpmcQueue, MutexQueue};
+use oxide_broker::{BoundedQueue, BrokerEngine, Message, MpmcQueue, MutexQueue, PublishError, Subscriber};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Mutex;
+use std::sync::{Mutex};
 use std::thread;
 
 // -----------------------------------------------------------------------
@@ -259,4 +259,180 @@ fn mutex_stress_small_capacity_high_contention() {
     for _ in 0..5 {
         run_stress::<MutexQueue<i32>>(2, 2, 2, 1000);
     }
+}
+
+// -----------------------------------------------------------------------
+// Pub/sub correctness tests
+// -----------------------------------------------------------------------
+
+fn make_broker(capacity: usize) -> BrokerEngine<i32> {
+    let broker = BrokerEngine::new();
+    broker.create_topic("test", capacity);
+    broker
+}
+
+#[test]
+fn pubsub_single_subscriber_basic() {
+    let broker = make_broker(16);
+    let publisher = broker.publisher("test").unwrap();
+    let subscriber = broker.subscribe("test").unwrap();
+
+    publisher.publish(1).unwrap();
+    publisher.publish(2).unwrap();
+    publisher.publish(3).unwrap();
+
+    assert_eq!(subscriber.try_recv(), Some(1));
+    assert_eq!(subscriber.try_recv(), Some(2));
+    assert_eq!(subscriber.try_recv(), Some(3));
+    assert_eq!(subscriber.try_recv(), None);
+}
+
+#[test]
+fn pubsub_no_subscribers_returns_error() {
+    let broker = make_broker(16);
+    let publisher = broker.publisher("test").unwrap();
+    assert_eq!(publisher.publish(1), Err(PublishError::NoSubscribers));
+}
+
+#[test]
+fn pubsub_fan_out_three_subscribers() {
+    const N: i32 = 100;
+    let broker = make_broker(256);
+    let publisher = broker.publisher("test").unwrap();
+    let sub_a = broker.subscribe("test").unwrap();
+    let sub_b = broker.subscribe("test").unwrap();
+    let sub_c = broker.subscribe("test").unwrap();
+
+    for i in 0..N {
+        while publisher.publish(i).is_err() {}
+    }
+
+    let drain = |sub: &Subscriber<i32>| -> Vec<i32> {
+        let mut v = Vec::new();
+        while let Some(x) = sub.try_recv() {
+            v.push(x);
+        }
+        v
+    };
+
+    let a = drain(&sub_a);
+    let b = drain(&sub_b);
+    let c = drain(&sub_c);
+
+    assert_eq!(a.len(), N as usize, "subscriber A missed messages");
+    assert_eq!(b.len(), N as usize, "subscriber B missed messages");
+    assert_eq!(c.len(), N as usize, "subscriber C missed messages");
+    // All three receive the same ordered sequence.
+    let expected: Vec<i32> = (0..N).collect();
+    assert_eq!(a, expected);
+    assert_eq!(b, expected);
+    assert_eq!(c, expected);
+}
+
+#[test]
+fn pubsub_topic_isolation() {
+    let broker: BrokerEngine<i32> = BrokerEngine::new();
+    broker.create_topic("alpha", 64);
+    broker.create_topic("beta", 64);
+
+    let pub_alpha = broker.publisher("alpha").unwrap();
+    let pub_beta = broker.publisher("beta").unwrap();
+    let sub_alpha = broker.subscribe("alpha").unwrap();
+    let sub_beta = broker.subscribe("beta").unwrap();
+
+    pub_alpha.publish(1).unwrap();
+    pub_alpha.publish(2).unwrap();
+    pub_beta.publish(10).unwrap();
+    pub_beta.publish(20).unwrap();
+
+    // alpha messages do not leak into beta and vice-versa.
+    assert_eq!(sub_alpha.try_recv(), Some(1));
+    assert_eq!(sub_alpha.try_recv(), Some(2));
+    assert_eq!(sub_alpha.try_recv(), None);
+
+    assert_eq!(sub_beta.try_recv(), Some(10));
+    assert_eq!(sub_beta.try_recv(), Some(20));
+    assert_eq!(sub_beta.try_recv(), None);
+}
+
+#[test]
+fn pubsub_subscriber_drop_unregisters() {
+    let broker = make_broker(16);
+    let publisher = broker.publisher("test").unwrap();
+
+    {
+        let _sub = broker.subscribe("test").unwrap();
+        assert_eq!(publisher.subscriber_count(), 1);
+    } // _sub dropped here — should deregister itself
+
+    assert_eq!(publisher.subscriber_count(), 0);
+    assert_eq!(publisher.publish(1), Err(PublishError::NoSubscribers));
+}
+
+#[test]
+fn pubsub_concurrent_publishers_fan_out() {
+    const N_PRODUCERS: usize = 4;
+    const OPS_PER_PRODUCER: i32 = 1_000;
+    const N_SUBSCRIBERS: usize = 3;
+    let total = N_PRODUCERS as i32 * OPS_PER_PRODUCER;
+
+    let broker = BrokerEngine::<i32>::new();
+    broker.create_topic("multi", 4096);
+
+    let publisher = broker.publisher("multi").unwrap();
+    let subscribers: Vec<Subscriber<i32>> = (0..N_SUBSCRIBERS)
+        .map(|_| broker.subscribe("multi").unwrap())
+        .collect();
+
+    thread::scope(|scope| {
+        for p in 0..N_PRODUCERS {
+            let publisher = publisher.clone();
+            scope.spawn(move || {
+                let start = p as i32 * OPS_PER_PRODUCER;
+                for v in start..start + OPS_PER_PRODUCER {
+                    while publisher.publish(v).is_err() {}
+                }
+            });
+        }
+    });
+
+    // Each subscriber must receive all `total` distinct values exactly once.
+    for sub in &subscribers {
+        let mut received = Vec::new();
+        while let Some(v) = sub.try_recv() {
+            received.push(v);
+        }
+        assert_eq!(received.len(), total as usize);
+        received.sort_unstable();
+        assert_eq!(received, (0..total).collect::<Vec<_>>());
+    }
+}
+
+#[test]
+fn pubsub_unknown_topic_returns_none() {
+    let broker: BrokerEngine<i32> = BrokerEngine::new();
+    assert!(broker.publisher("nonexistent").is_none());
+    assert!(broker.subscribe("nonexistent").is_none());
+}
+
+#[test]
+fn pubsub_message_envelope() {
+    let broker: BrokerEngine<Message<&str>> = BrokerEngine::new();
+    broker.create_topic("msgs", 16);
+
+    let publisher = broker.publisher("msgs").unwrap();
+    let subscriber = broker.subscribe("msgs").unwrap();
+
+    publisher.publish(Message::new("hello", 1)).unwrap();
+    publisher.publish(Message::new("world", 2)).unwrap();
+
+    let first = subscriber.try_recv().unwrap();
+    assert_eq!(first.payload, "hello");
+    assert_eq!(first.sequence, 1);
+
+    let second = subscriber.try_recv().unwrap();
+    assert_eq!(second.payload, "world");
+    assert_eq!(second.sequence, 2);
+
+    assert!(subscriber.try_recv().is_none());
 }

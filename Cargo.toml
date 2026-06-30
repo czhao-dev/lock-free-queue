@@ -1,13 +1,13 @@
 [package]
-name = "lfqueue"
-version = "0.1.0"
+name = "oxide_broker"
+version = "0.2.0"
 edition = "2021"
 license = "MIT"
-description = "A bounded, lock-free MPMC queue implemented in Rust with atomics and explicit memory ordering."
+description = "High-throughput, in-memory pub/sub message engine built on a lock-free MPMC ring buffer."
 repository = "https://github.com/czhao-dev/lock-free-queue"
 
 [lib]
-name = "lfqueue"
+name = "oxide_broker"
 path = "src/lib.rs"
 
 [[example]]

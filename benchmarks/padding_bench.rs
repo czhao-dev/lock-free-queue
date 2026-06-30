@@ -1,4 +1,4 @@
-use lfqueue::MpmcQueue;
+use oxide_broker::MpmcQueue;
 use std::cell::UnsafeCell;
 use std::mem::MaybeUninit;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering};
